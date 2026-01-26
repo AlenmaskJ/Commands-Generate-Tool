@@ -1,5 +1,6 @@
 from flask import Flask, render_template_string, request, send_file, flash, redirect, url_for
-import pandas as pd
+import openpyxl
+import xlrd
 import re
 import os
 import tempfile
@@ -10,7 +11,7 @@ app = Flask(__name__)
 app.secret_key = 'command_generator_2026'  # 用于flash提示
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 限制上传文件最大16MB
 
-# 前端页面模板（整合HTML+CSS+JS）
+# 前端页面模板（和之前一致，无需修改）
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -85,56 +86,68 @@ HTML_TEMPLATE = '''
 '''
 
 
-# 提取模板中的所有变量（如从{x},{y}提取['x','y']）
+# 提取模板中的所有变量（和之前一致）
 def extract_variables(template):
-    pattern = r'\{(\w+)\}'  # 匹配{变量名}格式，变量名仅包含字母/数字/下划线
+    pattern = r'\{(\w+)\}'
     variables = re.findall(pattern, template)
-    return list(set(variables))  # 去重
+    return list(set(variables))
 
 
-# 生成命令的核心函数
+# 轻量版Excel读取+命令生成（替换pandas）
 def generate_commands_from_template(template, excel_path):
-    # 提取模板中的变量
     variables = extract_variables(template)
     if not variables:
         raise ValueError("命令模板中未检测到有效变量（变量需用{变量名}格式，如{x}）")
 
-    # 读取Excel文件
-    try:
-        # 自动适配xls/xlsx格式
-        if excel_path.endswith('.xls'):
-            df = pd.read_excel(excel_path, engine='xlrd')
-        else:
-            df = pd.read_excel(excel_path, engine='openpyxl')
-    except Exception as e:
-        raise ValueError(f"读取Excel文件失败：{str(e)}")
-
-    # 检查Excel列名是否包含所有变量
-    missing_vars = [var for var in variables if var not in df.columns]
-    if missing_vars:
-        raise ValueError(f"Excel文件缺少以下变量列：{', '.join(missing_vars)}，请检查Excel列名是否与模板变量一致")
-
-    # 遍历每行生成命令
     commands = []
-    for index, row in df.iterrows():
-        # 跳过空值行（任意变量为空则跳过）
-        row_vars = {var: row[var] for var in variables}
-        if any(pd.isna(val) for val in row_vars.values()):
-            continue
-
-        # 替换模板中的变量
-        command = template
-        for var, val in row_vars.items():
-            command = command.replace(f'{{{var}}}', str(val))
-        commands.append(command)
+    # 处理xlsx格式
+    if excel_path.endswith('.xlsx'):
+        wb = openpyxl.load_workbook(excel_path, data_only=True)
+        ws = wb.active
+        # 获取表头
+        headers = [cell.value for cell in ws[1]]
+        # 检查缺失变量
+        missing_vars = [var for var in variables if var not in headers]
+        if missing_vars:
+            raise ValueError(f"Excel缺少变量列：{', '.join(missing_vars)}")
+        # 遍历数据行
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            row_dict = dict(zip(headers, row))
+            if any(row_dict.get(var) is None for var in variables):
+                continue
+            # 替换变量
+            command = template
+            for var in variables:
+                command = command.replace(f'{{{var}}}', str(row_dict[var]))
+            commands.append(command)
+    # 处理xls格式
+    elif excel_path.endswith('.xls'):
+        wb = xlrd.open_workbook(excel_path)
+        ws = wb.sheet_by_index(0)
+        headers = [ws.cell_value(0, col) for col in range(ws.ncols)]
+        missing_vars = [var for var in variables if var not in headers]
+        if missing_vars:
+            raise ValueError(f"Excel缺少变量列：{', '.join(missing_vars)}")
+        # 遍历数据行
+        for row_idx in range(1, ws.nrows):
+            row = [ws.cell_value(row_idx, col) for col in range(ws.ncols)]
+            row_dict = dict(zip(headers, row))
+            if any(row_dict.get(var) is None for var in variables):
+                continue
+            command = template
+            for var in variables:
+                command = command.replace(f'{{{var}}}', str(row_dict[var]))
+            commands.append(command)
+    else:
+        raise ValueError("仅支持.xlsx/.xls格式的Excel文件")
 
     if not commands:
-        raise ValueError("未生成任何有效命令，请检查Excel数据是否为空或匹配")
+        raise ValueError("未生成任何有效命令，请检查Excel数据")
 
     return commands
 
 
-# 保存命令到临时文件
+# 保存命令到文件（和之前一致）
 def save_commands_to_file(commands):
     temp_dir = tempfile.gettempdir()
     file_path = os.path.join(temp_dir, "generated_commands.txt")
@@ -143,7 +156,7 @@ def save_commands_to_file(commands):
     return os.path.basename(file_path), file_path
 
 
-# 主页面路由
+# 主页面路由（和之前一致）
 @app.route('/', methods=['GET', 'POST'])
 def index():
     commands = None
@@ -151,28 +164,21 @@ def index():
 
     if request.method == 'POST':
         try:
-            # 获取表单数据
             template = request.form['template'].strip()
             excel_file = request.files['excel_file']
 
-            # 校验文件
             if not excel_file.filename:
                 flash("请选择要上传的Excel文件")
                 return redirect(url_for('index'))
 
-            # 保存上传的Excel到临时文件
             filename = secure_filename(excel_file.filename)
             temp_excel_path = os.path.join(tempfile.gettempdir(), filename)
             excel_file.save(temp_excel_path)
 
-            # 生成命令
             command_list = generate_commands_from_template(template, temp_excel_path)
             commands = '\n'.join(command_list)
 
-            # 保存命令到文件，用于下载
             output_file, _ = save_commands_to_file(command_list)
-
-            # 删除临时Excel文件
             os.remove(temp_excel_path)
 
         except ValueError as e:
@@ -183,7 +189,7 @@ def index():
     return render_template_string(HTML_TEMPLATE, commands=commands, output_file=output_file)
 
 
-# 下载文件路由
+# 下载文件路由（和之前一致）
 @app.route('/download/<filename>')
 def download_file(filename):
     file_path = os.path.join(tempfile.gettempdir(), filename)
@@ -196,9 +202,5 @@ def download_file(filename):
 
 # 启动应用
 if __name__ == '__main__':
-    # 安装依赖提示
-    print("=" * 50)
-    print("使用前请先安装依赖：pip install flask pandas openpyxl xlrd werkzeug")
-    print("=" * 50)
-    # 启动Web服务（允许外部访问，端口5000）
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    print("通用命令生成工具已启动，访问 http://127.0.0.1:5000 使用")
+    app.run(host='0.0.0.0', port=5000, debug=False)
